@@ -560,10 +560,29 @@ static void t3_setStatus(NSString *s, UIColor *c) {
     });
 }
 
-static NSString *t3_machineCode(void) {
+// ★ 机器码候选列表（按可能性排序）——原版 T3Verify getMachineCode 是 MD5(IDFV)，
+//   官方 SDK 是 md5(...).upper()，大小写/去横线无法 100% 确定，因此逐个试
+static NSArray<NSString *> *t3_machineCodeCandidates(void) {
     NSString *idfv = [[[UIDevice currentDevice] identifierForVendor] UUIDString];
-    if (!idfv) idfv = @"unknown-device";
-    return idfv;
+    if (!idfv) idfv = @"";
+    NSString *nodash = [idfv stringByReplacingOccurrencesOfString:@"-" withString:@""];
+    NSMutableArray *a = [NSMutableArray array];
+    if (idfv.length) {
+        [a addObject:[md5Lower(idfv) uppercaseString]];   // ① 官方SDK风格：MD5 + 大写
+        [a addObject:md5Lower(idfv)];                     // ② MD5 小写
+        [a addObject:[md5Lower(nodash) uppercaseString]]; // ③ 去横线 MD5 大写
+        [a addObject:md5Lower(nodash)];                   // ④ 去横线 MD5 小写
+        [a addObject:[[idfv uppercaseString] stringByReplacingOccurrencesOfString:@"-" withString:@""]];  // ⑤ 纯大写无横线
+        [a addObject:[idfv uppercaseString]];             // ⑥ 大写原串
+        [a addObject:idfv];                               // ⑦ 原串
+    }
+    // 兜底：万一 IDFV 拿不到
+    if (a.count == 0) {
+        NSString *u = [[NSUUID UUID] UUIDString];
+        [a addObject:[md5Lower(u) uppercaseString]];
+        [a addObject:u];
+    }
+    return a;
 }
 
 static NSString *t3_nowDateStr(void) {
@@ -598,27 +617,50 @@ static void t3_verify(NSString *kami) {
 
     dispatch_async(gQueue, ^{
         @autoreleasepool {
-            NSString *imei = t3_machineCode();
-            t3log(@"校验 kami=%@ imei=%@", kami, imei);
+            // ★ 机器码多格式自动重试：哪个能过服务端就用哪个
+            NSArray<NSString *> *cands = t3_machineCodeCandidates();
+            NSDictionary *j = nil;
+            NSString *sString = nil, *imei = nil, *lastMsg = nil;
             NSError *e = nil;
-            NSString *sString = nil;
-            NSDictionary *j = t3Call(kLoginCode, @[@"kami", @"imei"],
-                                     @{@"kami": kami, @"imei": imei}, &sString, &e);
+            for (NSUInteger ci = 0; ci < cands.count; ci++) {
+                NSString *cand = cands[ci];
+                t3log(@"校验 kami=%@  imei候选[%lu/%lu]=%@", kami,
+                      (unsigned long)(ci + 1), (unsigned long)cands.count, cand);
+                e = nil; sString = nil;
+                NSDictionary *r = t3Call(kLoginCode, @[@"kami", @"imei"],
+                                         @{@"kami": kami, @"imei": cand}, &sString, &e);
+                if (!r) {
+                    t3log(@"  候选%lu 请求失败: %@", (unsigned long)(ci + 1), e.localizedDescription);
+                    continue;
+                }
+                id co = r[@"code"];
+                BOOL ok = ([co isKindOfClass:[NSNumber class]] && [co intValue] == 200)
+                       || ([co isKindOfClass:[NSString class]] && [co isEqualToString:@"200"]);
+                NSString *msg = [r[@"msg"] description];
+                j = r; imei = cand;
+                if (ok) {
+                    t3log(@"  ★★ 候选%lu 验证通过，机器码格式已确定", (unsigned long)(ci + 1));
+                    break;
+                }
+                lastMsg = msg;
+                t3log(@"  候选%lu 被服务端拒绝: %@", (unsigned long)(ci + 1), msg);
+            }
             if (!j) {
                 gBusy = NO;
-                t3_setStatus(e.localizedDescription ?: @"请求失败", [UIColor colorWithRed:1 green:.45 blue:.45 alpha:1]);
+                t3_setStatus(e.localizedDescription ?: @"无法连接验证服务器",
+                             [UIColor colorWithRed:1 green:.45 blue:.45 alpha:1]);
                 return;
             }
             id codeObj = j[@"code"];
             BOOL okCode = ([codeObj isKindOfClass:[NSNumber class]] && [codeObj intValue] == 200)
                        || ([codeObj isKindOfClass:[NSString class]] && [codeObj isEqualToString:@"200"]);
             if (!okCode) {
-                NSString *m = [j[@"msg"] description];
                 gBusy = NO;
-                t3_setStatus((m.length && ![m isEqualToString:@"(null)"]) ? m : @"验证失败",
+                t3_setStatus((lastMsg.length && ![lastMsg isEqualToString:@"(null)"]) ? lastMsg : @"验证失败",
                              [UIColor colorWithRed:1 green:.45 blue:.45 alpha:1]);
                 return;
             }
+            (void)imei;
             NSString *kid = [j[@"id"] description];
             NSString *end = [j[@"end_time"] description];
             NSString *token = [j[@"token"] description];

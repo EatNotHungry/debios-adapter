@@ -89,7 +89,8 @@ jobs:
             -Wno-objc-messaging-id \
             -I "$GITHUB_WORKSPACE/src" \
             -isysroot "$SDK" \
-            -framework UIKit -framework Foundation -framework ObjectiveC -framework CoreGraphics \
+            -framework UIKit -framework Foundation -framework CoreGraphics \
+            -lobjc \
             -install_name @executable_path/T3Adapter.dylib \
             -o T3Adapter.dylib \
             "$GITHUB_WORKSPACE/src/T3Adapter.m"

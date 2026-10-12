@@ -330,24 +330,55 @@ static NSString *rsaEncryptHex(NSString *plain) {
     return hexUpper([NSData dataWithBytes:out length:KBYTES]);
 }
 
-// 公钥解密（服务端私钥加密，PKCS#1 v1.5 块类型 0x01）<- base64 文本
+// 公钥分段解密（服务端私钥加密，PKCS#1 v1.5 块类型 0x01）
+// ★★ 关键：服务端「登录成功」的响应有 384 字节 = 3 个 RSA 块！
+//         单块 RSA(PKCS1v15) 最多只能装 117 字节明文，所以长响应必然分段。
+//         必须每 128 字节解一块再拼接（官方 SDK 的 decrypt() 就是这么做的）。
 static NSString *rsaDecryptBase64(NSString *b64text) {
     if (!loadPublicKey()) return nil;
+    if (![b64text isKindOfClass:[NSString class]]) return nil;
     NSData *ct = [[NSData alloc] initWithBase64EncodedString:
                   [b64text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
                                                      options:0];
-    if (!ct || ct.length != KBYTES) return nil;
-    bn_t c, m;
-    bn_from_be(&c, ct.bytes, KBYTES);
-    bn_pow_e(&m, &c, &gN);
-    uint8_t blk[KBYTES];
-    bn_to_be(&m, blk, KBYTES);
-    if (blk[0] != 0x00 || blk[1] != 0x01) return nil;
-    int i = 2;
-    while (i < KBYTES && blk[i] == 0xFF) i++;
-    if (i >= KBYTES || blk[i] != 0x00) return nil;
-    i++;
-    return [[NSString alloc] initWithBytes:blk + i length:KBYTES - i encoding:NSUTF8StringEncoding];
+    if (!ct || ct.length == 0) return nil;
+
+    NSUInteger nblocks = (ct.length + KBYTES - 1) / KBYTES;
+    NSMutableData *out = [NSMutableData dataWithCapacity:ct.length];
+    const uint8_t *src = (const uint8_t *)ct.bytes;
+
+    for (NSUInteger b = 0; b < nblocks; b++) {
+        uint8_t block[KBYTES];
+        memset(block, 0, KBYTES);
+        NSUInteger off = b * KBYTES;
+        NSUInteger n = ct.length - off;
+        if (n > KBYTES) n = KBYTES;
+        memcpy(block, src + off, n);
+
+        bn_t c, m;
+        bn_from_be(&c, block, KBYTES);
+        bn_pow_e(&m, &c, &gN);
+        uint8_t blk[KBYTES];
+        bn_to_be(&m, blk, KBYTES);
+
+        if (blk[0] == 0x00 && blk[1] == 0x01) {
+            int i = 2;
+            while (i < KBYTES && blk[i] == 0xFF) i++;
+            if (i < KBYTES && blk[i] == 0x00) {
+                [out appendBytes:blk + i + 1 length:KBYTES - i - 1];
+            } else {
+                [out appendBytes:blk length:KBYTES];
+            }
+        } else {
+            [out appendBytes:blk length:KBYTES];
+        }
+    }
+
+    // 去掉尾部的 NUL 填充（否则 JSON 解析会失败）
+    NSMutableData *trimmed = [NSMutableData dataWithData:out];
+    while (trimmed.length > 0 && ((const uint8_t *)trimmed.bytes)[trimmed.length - 1] == 0) {
+        [trimmed setLength:trimmed.length - 1];
+    }
+    return [[NSString alloc] initWithData:trimmed encoding:NSUTF8StringEncoding];
 }
 
 #pragma mark ================= 日志（文件描述符，信号安全） =================

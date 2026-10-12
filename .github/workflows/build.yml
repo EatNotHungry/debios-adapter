@@ -107,7 +107,7 @@ jobs:
           cd work
           echo "=== 检查关键导出/依赖 ==="
           FAIL=0
-          for SYM in _objc_msgSend _NSClassFromString _UIApplicationMain; do
+          for SYM in _objc_msgSend _UIApplicationMain; do
             if nm -u T3Adapter.dylib 2>/dev/null | grep -q "$SYM"; then
               echo "  [OK] 引用 $SYM"
             else

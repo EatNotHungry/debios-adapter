@@ -1,0 +1,17 @@
+fix(v13): NSNumber passed to rsaEncryptHex caused unrecognized-selector SIGABRT + crash diagnostics
+
+Root cause of the crash after entering the card key:
+  t3Call stored NSNumber for the t parameter
+  rsaEncryptHex internally calls [plain dataUsingEncoding:]
+  NSNumber does not respond to that selector -> unrecognized selector -> SIGABRT
+  The encryption loop therefore died on the 3rd parameter (t), earlier than MD5.
+  Fix: force every parameter value to NSString, plus isKindOfClass guards at entry points.
+
+Also removed the CommonCrypto dependency (own MD5) so no symbol lacks a provider.
+
+Diagnostics added because the client cannot supply an .ips:
+1) atexit hook: logs when the process leaves via exit(), which produces no ips
+2) signal handler writes the signal number to the log using write() only
+3) NSSetUncaughtExceptionHandler records exception name, reason and call stack
+4) t3Call logs four stages: encrypt, sign, build body, receive and decrypt
+5) constructor self-check: RSA encrypt, MD5("abc") compare, big-int modpow

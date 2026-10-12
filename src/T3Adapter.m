@@ -23,6 +23,10 @@
 #import <unistd.h>
 #import <time.h>
 #import <string.h>
+#import <fcntl.h>
+#import <signal.h>
+#import <stdio.h>
+#import <sys/stat.h>
 // ★ 不引用 CommonCrypto：iOS 上 _CC_MD5 若未被 libSystem 重导出，
 //   就会在「首次调用时」被 dyld abort 掉（Symbol not found）。
 //   自己实现 MD5，符号表里零外部依赖。
@@ -96,6 +100,8 @@ static void md5_final(md5_t *c, uint8_t out[16]) {
 
 /// 返回 32 位小写十六进制 MD5
 static NSString *md5Lower(NSString *s) {
+    if (!s) return @"";
+    if (![s isKindOfClass:[NSString class]]) s = [s description];   // 防御：非字符串先转
     if (!s) return @"";
     const char *cs = s.UTF8String;
     if (!cs) return @"";
@@ -301,7 +307,10 @@ static NSString *hexUpper(NSData *d) {
 // 公钥加密（PKCS#1 v1.5，块类型 0x02）-> 大写 HEX
 static NSString *rsaEncryptHex(NSString *plain) {
     if (!loadPublicKey()) return nil;
+    if (!plain) return nil;
+    if (![plain isKindOfClass:[NSString class]]) plain = [plain description];   // 防御
     NSData *msg = [plain dataUsingEncoding:NSUTF8StringEncoding];
+    if (!msg) return nil;
     if (msg.length > KBYTES - 11) return nil;
     uint8_t blk[KBYTES];
     blk[0] = 0x00; blk[1] = 0x02;
@@ -341,38 +350,90 @@ static NSString *rsaDecryptBase64(NSString *b64text) {
     return [[NSString alloc] initWithBytes:blk + i length:KBYTES - i encoding:NSUTF8StringEncoding];
 }
 
-#pragma mark ================= 日志 =================
+#pragma mark ================= 日志（文件描述符，信号安全） =================
 
-static NSString *gLogPath = nil;
+static int gLogFd = -1;
+static char gLogPathBuf[256] = {0};
+
+static void t3_openLog(void) {
+    if (gLogFd >= 0) return;
+    const char *cands[] = {
+        "/var/mobile/Library/Logs/T3Adapter.log",
+        "/var/mobile/Documents/T3Adapter.log",
+        "/tmp/T3Adapter.log",
+        NULL
+    };
+    for (int i = 0; cands[i]; i++) {
+        char dir[256];
+        strncpy(dir, cands[i], sizeof(dir) - 1); dir[sizeof(dir) - 1] = 0;
+        char *slash = strrchr(dir, '/');
+        if (slash) { *slash = 0; mkdir(dir, 0755); }
+        int fd = open(cands[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            gLogFd = fd;
+            strncpy(gLogPathBuf, cands[i], sizeof(gLogPathBuf) - 1);
+            return;
+        }
+    }
+    // 沙盒内兜底
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *p = [docs stringByAppendingPathComponent:@"T3Adapter.log"];
+    int fd = open(p.UTF8String, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        gLogFd = fd;
+        strncpy(gLogPathBuf, p.UTF8String, sizeof(gLogPathBuf) - 1);
+    }
+}
+
+// 信号安全：只 write()
+static void t3_raw(const char *s) { if (gLogFd >= 0) { ssize_t _ = write(gLogFd, s, strlen(s)); (void)_; } }
+
 static void t3log(NSString *fmt, ...) {
     @autoreleasepool {
         va_list ap; va_start(ap, fmt);
         NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
         va_end(ap);
         NSLog(@"[T3Adapter] %@", body);
-        if (!gLogPath) {
-            NSArray *c = @[@"/var/mobile/Library/Logs/T3Adapter.log",
-                           @"/var/mobile/Documents/T3Adapter.log"];
-            for (NSString *p in c) {
-                [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent]
-                                          withIntermediateDirectories:YES attributes:nil error:NULL];
-                if ([[NSFileManager defaultManager] createFileAtPath:p contents:[NSData data] attributes:nil]) {
-                    gLogPath = p; break;
-                }
-            }
-            if (!gLogPath) {
-                NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-                gLogPath = [docs stringByAppendingPathComponent:@"T3Adapter.log"];
-                [[NSFileManager defaultManager] createFileAtPath:gLogPath contents:[NSData data] attributes:nil];
-            }
-        }
-        if (gLogPath) {
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
-            if (fh) { @try { [fh seekToEndOfFile];
-                [fh writeData:[[body stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-                [fh closeFile]; } @catch (NSException *e) {} }
-        }
+        if (gLogFd < 0) t3_openLog();
+        NSString *line = [body stringByAppendingString:@"\n"];
+        t3_raw(line.UTF8String);
     }
+}
+
+// 未捕获 Objective-C 异常（普通线程，可安全用 NSLog/NSFileHandle）
+static void t3_uncaught(NSException *ex) {
+    t3log(@"");
+    t3log(@"💥💥💥 未捕获异常 💥💥💥");
+    t3log(@"  name  : %@", ex.name);
+    t3log(@"  reason: %@", ex.reason);
+    NSArray *st = ex.callStackSymbols;
+    for (NSUInteger i = 0; i < st.count && i < 32; i++) t3log(@"  %@", st[i]);
+    t3log(@"💥💥💥 结束 💥💥💥");
+}
+
+// 致命信号（只有 write()，异步信号安全）
+static void t3_signal(int sig) {
+    char b[160];
+    int n = snprintf(b, sizeof(b),
+        "\n💥💥 致命信号 %d  (11=SIGSEGV 6=SIGABRT 10=SIGBUS 4=SIGILL 5=SIGTRAP 8=SIGFPE)\n",
+        sig);
+    if (n > 0) t3_raw(b);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+// ★ 关键诊断：如果是 exit() 主动退出（不是崩溃），iOS 不会生成 ips，
+//   这个钩子会在日志里留下证据，一眼区分「崩溃」和「被主动杀掉」
+static void t3_atexit(void) {
+    t3_raw("\n⚠️⚠️ 进程通过 exit() 正常退出 —— 这不是崩溃！\n"
+           "     说明有代码主动调用了 exit/abort，或反调试逻辑触发\n");
+}
+
+static void t3_installCrashHandlers(void) {
+    NSSetUncaughtExceptionHandler(&t3_uncaught);
+    int sigs[] = {SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGTRAP, SIGFPE};
+    for (int i = 0; i < 6; i++) signal(sigs[i], t3_signal);
+    atexit(t3_atexit);
 }
 
 #pragma mark ================= HTTP =================
@@ -391,27 +452,40 @@ static NSDictionary *t3Call(NSString *code, NSArray<NSString *> *keys,
 
     NSMutableDictionary *p = [NSMutableDictionary dictionary];
     for (NSString *k in ordered) {
-        if ([k isEqualToString:@"t"]) p[k] = @((long long)time(NULL));
-        else p[k] = [values[k] description];
+        // ★ 必须全部转成 NSString：rsaEncryptHex 内部会调 dataUsingEncoding:，
+        //   若传 NSNumber 会「无法识别的选择器」直接崩
+        if ([k isEqualToString:@"t"]) {
+            p[k] = [NSString stringWithFormat:@"%lld", (long long)time(NULL)];
+        } else {
+            id v = values[k];
+            p[k] = (v != nil) ? [v description] : @"";
+        }
     }
 
     // 1) 逐参数 RSA 加密（保持顺序）
     NSMutableDictionary *enc = [NSMutableDictionary dictionary];
+    t3log(@"  [1/4] 开始 RSA 加密 %lu 个参数...", (unsigned long)ordered.count);
     for (NSString *k in ordered) {
+        t3log(@"        加密 %@ (明文长度 %lu)", k, (unsigned long)[p[k] length]);
         NSString *e = rsaEncryptHex(p[k]);
         if (!e) { if (err) *err = [NSError errorWithDomain:@"t3" code:3
                         userInfo:@{NSLocalizedDescriptionKey: @"参数加密失败"}]; return nil; }
         enc[k] = e;
+        t3log(@"        -> %@ 完成", k);
     }
 
     // 2) 签名
+    t3log(@"  [2/4] 计算签名...");
     NSMutableArray *parts = [NSMutableArray array];
     for (NSString *k in ordered) [parts addObject:[NSString stringWithFormat:@"%@=%@", k, enc[k]]];
     NSString *sString = [[parts componentsJoinedByString:@"&"] stringByAppendingFormat:@"&%@", kAppKey];
+    t3log(@"        签名原文: %@", [sString substringToIndex:MIN(60, sString.length)]);
     enc[@"s"] = rsaEncryptHex(md5Lower(sString));
     if (outSString) *outSString = sString;
+    t3log(@"        签名完成");
 
     // 3) POST（服务器故障切换）
+    t3log(@"  [3/4] 组装请求体...");
     NSCharacterSet *safe = [NSCharacterSet URLQueryAllowedCharacterSet];
     NSMutableArray *kv = [NSMutableArray array];
     for (NSString *k in ordered) {
@@ -445,12 +519,13 @@ static NSDictionary *t3Call(NSString *code, NSArray<NSString *> *keys,
         dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(9 * NSEC_PER_SEC)));
 
         if (!respData || respData.length == 0) {
-            t3log(@"  %@ -> 无响应(%@)", srv, respErr.localizedDescription ?: @"空");
+            t3log(@"  [4/4] %@ -> 无响应(%@)", srv, respErr.localizedDescription ?: @"空");
             continue;
         }
+        t3log(@"  [4/4] %@ -> 收到 %lu 字节，开始 RSA 解密...", srv, (unsigned long)respData.length);
         NSString *txt = [[NSString alloc] initWithData:respData encoding:NSUTF8StringEncoding];
         NSString *dec = rsaDecryptBase64(txt);
-        if (!dec) { t3log(@"  %@ -> 解密失败", srv); continue; }
+        if (!dec) { t3log(@"       解密失败"); continue; }
         NSData *jd = [dec dataUsingEncoding:NSUTF8StringEncoding];
         id obj = [NSJSONSerialization JSONObjectWithData:jd options:0 error:NULL];
         if ([obj isKindOfClass:[NSDictionary class]]) {
@@ -669,27 +744,45 @@ static void t3_didFinish(id self, SEL _cmd, UIApplication *app, NSDictionary *op
 __attribute__((constructor))
 static void t3_ctor(void) {
     @autoreleasepool {
-        t3log(@"========================================");
-        t3log(@"=== T3Adapter v10 启动 (pid=%d) ===", getpid());
-        t3log(@"日志: %@", gLogPath);
-        BOOL ok = loadPublicKey();
-        t3log(@"公钥解析: %@", ok ? @"成功(1024位)" : @"失败");
-        if (ok) {
-            NSString *test = rsaEncryptHex(@"1");
-            t3log(@"自检加密: %@", test ? [test substringToIndex:32] : @"失败");
-        }
-        Class c = NSClassFromString(@"MainApplicationDelegate");
-        if (c) {
-            SEL s = NSSelectorFromString(@"application:didFinishLaunchingWithOptions:");
-            Method m = class_getInstanceMethod(c, s);
-            if (m) {
-                gOrigDidFinish = method_getImplementation(m);
-                class_replaceMethod(c, s, (IMP)t3_didFinish, method_getTypeEncoding(m));
-                t3log(@"✅ 已挂 %@ didFinishLaunching", c);
+        t3_openLog();
+        t3_installCrashHandlers();
+        @try {
+            t3log(@"========================================");
+            t3log(@"=== T3Adapter v13 启动 (pid=%d) ===", getpid());
+            t3log(@"日志文件: %s", gLogPathBuf);
+            t3log(@"架构/系统: iOS %@", [[UIDevice currentDevice] systemVersion]);
+            BOOL ok = loadPublicKey();
+            t3log(@"RSA 公钥解析: %@", ok ? @"成功（1024位，e=65537）" : @"❌ 失败");
+            if (ok) {
+                // 自检：加密 + 解密 + MD5
+                NSString *t1 = rsaEncryptHex(@"1");
+                t3log(@"自检 RSA 加密: %@", t1 ? [t1 substringToIndex:32] : @"❌失败");
+                NSString *m = md5Lower(@"abc");
+                t3log(@"自检 MD5(\"abc\"): %@  %@", m,
+                      [m isEqualToString:@"900150983cd24fb0d6963f7d28e17f72"] ? @"✅正确" : @"❌错误");
+                uint8_t blk[KBYTES];
+                for (int i = 0; i < KBYTES; i++) blk[i] = (uint8_t)(i + 1);
+                bn_t x, y; bn_from_be(&x, blk, KBYTES);
+                bn_pow_e(&y, &x, &gN);
+                t3log(@"自检 大数模幂: %@", bn_cmp(&y, &x) != 0 ? @"✅ 运算完成" : @"❓ 结果等于输入");
             }
-        } else {
-            t3log(@"⚠️ 没找到 MainApplicationDelegate");
+            Class c = NSClassFromString(@"MainApplicationDelegate");
+            if (c) {
+                SEL s = NSSelectorFromString(@"application:didFinishLaunchingWithOptions:");
+                Method m = class_getInstanceMethod(c, s);
+                if (m) {
+                    gOrigDidFinish = method_getImplementation(m);
+                    class_replaceMethod(c, s, (IMP)t3_didFinish, method_getTypeEncoding(m));
+                    t3log(@"✅ 已挂 %@ 的 didFinishLaunchingWithOptions:", c);
+                } else {
+                    t3log(@"⚠️ MainApplicationDelegate 没有 didFinishLaunchingWithOptions:");
+                }
+            } else {
+                t3log(@"⚠️ 没找到 MainApplicationDelegate（靠 RootViewController 兜底）");
+            }
+            t3log(@"=== 注入完成 ===");
+        } @catch (NSException *ex) {
+            t3log(@"💥 构造器抛异常: %@ / %@", ex.name, ex.reason);
         }
-        t3log(@"=== 注入完成 ===");
     }
 }

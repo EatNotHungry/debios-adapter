@@ -82,6 +82,8 @@ jobs:
             -dynamiclib \
             -fobjc-arc \
             -fmodules \
+            -Wno-deprecated-declarations \
+            -Wno-objc-messaging-id \
             -I "$GITHUB_WORKSPACE/src" \
             -isysroot "$SDK" \
             -framework UIKit -framework Foundation -framework ObjectiveC -framework CoreGraphics \
@@ -92,6 +94,33 @@ jobs:
           ls -lh T3Adapter.dylib
           file T3Adapter.dylib
           otool -L T3Adapter.dylib
+
+      - name: 编译质量门禁（缺符号直接失败，别把坏包发出去）
+        run: |
+          cd work
+          echo "=== 检查关键导出/依赖 ==="
+          FAIL=0
+          for SYM in _objc_msgSend _NSClassFromString _class_getInstanceMethod _class_replaceMethod _UIApplicationMain; do
+            if nm -u T3Adapter.dylib 2>/dev/null | grep -q "$SYM"; then
+              echo "  [OK] 引用 $SYM"
+            else
+              case "$SYM" in
+                _UIApplicationMain) echo "  [ok] 未引用 $SYM（正常，我们不建 app）" ;;
+                *) echo "  [!!] 缺少 $SYM"; FAIL=1 ;;
+              esac
+            fi
+          done
+          echo "=== 确认没有把 T3Gate 的符号重复定义进来 ==="
+          if nm T3Adapter.dylib 2>/dev/null | grep -qE 'T _T3InstallHooks|T _T3GateConstructor'; then
+            echo "  [!!] 适配层里出现 T3Gate 的 C 符号，会冲突"; FAIL=1
+          else
+            echo "  [OK] 无 T3Gate 符号冲突"
+          fi
+          echo "=== 确认 dylib 架构/类型 ==="
+          file T3Adapter.dylib | grep -q 'arm64' || { echo "  [!!] 不是 arm64"; FAIL=1; }
+          file T3Adapter.dylib | grep -qi 'dynamically linked' || { echo "  [!!] 不是 dynamiclib"; FAIL=1; }
+          if [ "$FAIL" != "0" ]; then echo "[FAIL] 编译质量门禁未通过"; exit 1; fi
+          echo "[PASS] 质量门禁通过"
 
       - name: 安装 ldid（用于签名）
         if: ${{ github.event.inputs.sign_mode != 'none' }}

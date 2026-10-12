@@ -90,6 +90,9 @@ jobs:
             -I "$GITHUB_WORKSPACE/src" \
             -isysroot "$SDK" \
             -framework UIKit -framework Foundation -framework CoreGraphics \
+            -framework Security \
+            -Wl,-undefined,error \
+            -Werror=implicit-function-declaration \
             -lobjc \
             -install_name @executable_path/T3Adapter.dylib \
             -o T3Adapter.dylib \
@@ -123,6 +126,22 @@ jobs:
           echo "=== 确认 dylib 架构/类型 ==="
           file T3Adapter.dylib | grep -q 'arm64' || { echo "  [!!] 不是 arm64"; FAIL=1; }
           file T3Adapter.dylib | grep -qi 'dynamically linked' || { echo "  [!!] 不是 dynamiclib"; FAIL=1; }
+
+          echo "=== ★ 未定义符号清单（每个都必须由已链接的框架提供）==="
+          nm -u T3Adapter.dylib | sed 's/^ *//' | sort > /tmp/und.txt || true
+          echo "  共 $(wc -l < /tmp/und.txt) 个"
+          cat /tmp/und.txt | head -60
+          echo "=== ★ 检查已知会「运行时 Symbol not found」的符号 ==="
+          for BAD in _CC_MD5 _CC_SHA256 _CCCrypt _SecKeyCreateWithData _SecKeyCreateEncryptedData _SecCertificateCopyData _kSecAttrKeyTypeRSA; do
+            if grep -qx "$BAD" /tmp/und.txt; then
+              echo "  [!!] 引用了 $BAD —— 该符号没有Provider，首次调用会被 dyld abort"; FAIL=1
+            else
+              echo "  [ok] 无 $BAD"
+            fi
+          done
+          echo "=== ★ 确认已链接的框架覆盖了所有符号（-undefined,error 已保证）==="
+          otool -L T3Adapter.dylib | tail -n +2 | awk '{print "  " $1}'
+
           if [ "$FAIL" != "0" ]; then echo "[FAIL] 编译质量门禁未通过"; exit 1; fi
           echo "[PASS] 质量门禁通过"
 

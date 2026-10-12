@@ -1,9 +1,9 @@
 // =====================================================================
-//  T3Adapter.m   v2 —— 强制卡密门禁
+//  T3Adapter.m   v3 —— 强制卡密门禁（编译安全的 objc_msgSend 写法）
 //
 //  行为：
 //    1. 进程启动就建自己的 keyWindow 铺遮罩，未验证前 app 界面进不去
-//    2. 启动后挂住 AppDelegate 的 didFinishLaunching，防止被 app 自己的 window 盖住
+//    2. 挂住 AppDelegate 的 didFinishLaunching，防止被 app 自己的 window 盖住
 //    3. 卡密走 T3Gate.dylib 里的 T3Verify → loginWithKami:imei:
 //    4. 成功后撤遮罩；进主界面后每 5 分钟心跳
 //
@@ -12,13 +12,14 @@
 //    * 不读宿主类任何私有 ivar（原版读 _authed @偏移0x6B0 直接抛异常）
 //    * 网络全在后台串行队列，绝不阻塞主线程（防 0x8badf00d watchdog）
 //
-//  编译器注意：本文件所有符号都带 t3a_ / T3A 前缀，避免和 T3Gate.dylib 的
-//  _T3InstallHooks / _T3GateConstructor 等 C 符号冲突。
+//  编译兼容：所有 objc_msgSend 调用点先转 void* 再转目标函数指针，
+//  避开新版 clang 的 -Wcast-function-type-mismatch 直接顶掉构建。
 // =====================================================================
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dispatch/dispatch.h>
 #import "T3Verify.h"
 
 #pragma mark ================= 配置（从 T3Gate.dylib 实体反出，不必改） =================
@@ -51,7 +52,7 @@ static UIWindow    *gLockWindow = nil;
 static UILabel     *gStatusLbl  = nil;
 static UITextField *gCodeField  = nil;
 static dispatch_queue_t gQueue  = NULL;
-static IMP          gOrigDidFinishLaunching = NULL;   // 原 AppDelegate 实现
+static IMP          gOrigDidFinishLaunching = NULL;
 
 static void t3a_showLock(void);
 static void t3a_startVerify(NSString *kami);
@@ -68,8 +69,9 @@ static NSString *t3a_machineCode(void) {
     Class c = NSClassFromString(@"T3Verify");
     SEL s = NSSelectorFromString(@"getMachineCode");
     if (c && [c respondsToSelector:s]) {
-        NSString *mc = ((id(*)(id, SEL))objc_msgSend)(c, s);
-        if ([mc isKindOfClass:[NSString class]] && mc.length) return mc;
+        id (*fn)(id, SEL) = (id (*)(id, SEL))(void *)objc_msgSend;
+        id mc = fn(c, s);
+        if ([mc isKindOfClass:[NSString class]] && [mc length]) return mc;
     }
     return [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"unknown";
 }
@@ -101,19 +103,20 @@ static T3Verify *t3a_makeVerify(void) {
     SEL sRsa = NSSelectorFromString(@"initRsaWithLoginCode:noticeCode:versionCode:heartbeatCode:appkey:rsaPublicKey:error:");
     if ([cls instancesRespondToSelector:sRsa]) {
         id (*fn)(id, SEL, NSString*, NSString*, NSString*, NSString*, NSString*, NSString*, NSError**) =
-            (id(*)(id, SEL, NSString*, NSString*, NSString*, NSString*, NSString*, NSString*, NSError**))objc_msgSend;
+            (id (*)(id, SEL, NSString*, NSString*, NSString*, NSString*, NSString*, NSString*, NSError**))(void *)objc_msgSend;
         NSError *err = nil;
         gVerify = fn([cls alloc], sRsa, kT3LoginCode, kT3NoticeCode, kT3VersionCode,
                      kT3HeartbeatCode, kT3AppKey, kT3PublicKeyPEM, &err);
         if (gVerify) t3a_log(@"✅ RSA 模式初始化成功");
-        else         t3a_log(@"⚠️ RSA 模式失败(%@)，退化 base64 模式", err.localizedDescription);
+        else         t3a_log(@"⚠️ RSA 模式失败(%@)，退化 base64 模式", [err localizedDescription]);
     }
+
     // ② 自定义 base64 模式（兜底）
     if (!gVerify) {
         SEL sB64 = NSSelectorFromString(@"initWithLoginCode:noticeCode:versionCode:heartbeatCode:appkey:base64Charset:");
         if ([cls instancesRespondToSelector:sB64]) {
             id (*fn)(id, SEL, NSString*, NSString*, NSString*, NSString*, NSString*, NSString*) =
-                (id(*)(id, SEL, NSString*, NSString*, NSString*, NSString*, NSString*, NSString*))objc_msgSend;
+                (id (*)(id, SEL, NSString*, NSString*, NSString*, NSString*, NSString*, NSString*))(void *)objc_msgSend;
             gVerify = fn([cls alloc], sB64, kT3LoginCode, kT3NoticeCode, kT3VersionCode,
                          kT3HeartbeatCode, kT3AppKey, kT3Base64Charset);
             if (gVerify) t3a_log(@"✅ base64 模式初始化成功");
@@ -123,9 +126,9 @@ static T3Verify *t3a_makeVerify(void) {
 
     SEL sChk = NSSelectorFromString(@"checkInit:");
     if ([gVerify respondsToSelector:sChk]) {
-        BOOL (*fn)(id, SEL, NSError**) = (BOOL(*)(id, SEL, NSError**))objc_msgSend;
+        BOOL (*fn)(id, SEL, NSError**) = (BOOL (*)(id, SEL, NSError**))(void *)objc_msgSend;
         NSError *e = nil;
-        t3a_log(@"checkInit = %@ %@", fn(gVerify, sChk, &e) ? @"YES" : @"NO", e.localizedDescription ?: @"");
+        t3a_log(@"checkInit = %@ %@", fn(gVerify, sChk, &e) ? @"YES" : @"NO", [e localizedDescription] ?: @"");
     }
     return gVerify;
 }
@@ -156,7 +159,10 @@ static void t3a_unlock(void) {
 static void t3a_startVerify(NSString *kami) {
     if (gBusy) return;
     kami = [kami stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (kami.length == 0) { t3a_setStatus(@"请输入卡密", [UIColor colorWithRed:1 green:.45 blue:.45 alpha:1]); return; }
+    if ([kami length] == 0) {
+        t3a_setStatus(@"请输入卡密", [UIColor colorWithRed:1 green:.45 blue:.45 alpha:1]);
+        return;
+    }
 
     gBusy = YES;
     t3a_setStatus(@"验证中...", [UIColor colorWithWhite:.85 alpha:1]);
@@ -178,24 +184,24 @@ static void t3a_startVerify(NSString *kami) {
             SEL s = NSSelectorFromString(@"loginWithKami:imei:");
             if ([gVerify respondsToSelector:s]) {
                 T3LoginResult *(*fn)(id, SEL, NSString*, NSString*) =
-                    (T3LoginResult *(*)(id, SEL, NSString*, NSString*))objc_msgSend;
+                    (T3LoginResult *(*)(id, SEL, NSString*, NSString*))(void *)objc_msgSend;
                 r = fn(gVerify, s, kami, imei);
             }
-            BOOL ok = (r && r.success);
-            NSString *msg = ok ? @"验证成功" : ((r.error.length ? r.error : @"验证失败，请检查卡密"));
+            BOOL ok = (r && [r success]);
+            NSString *msg = ok ? @"验证成功" : ([[r error] length] ? [r error] : @"验证失败，请检查卡密");
 
             if (ok) {
-                if (r.statecode) gStatecode = r.statecode;
-                if (r.endTime)   gEndTime   = r.endTime;
+                if ([r statecode]) gStatecode = [r statecode];
+                if ([r endTime])   gEndTime   = [r endTime];
                 t3a_writeState();
             }
-            t3a_log(@"结果 ok=%d msg=%@ end=%@ statecode=%@", ok, msg, r.endTime, r.statecode);
+            t3a_log(@"结果 ok=%d msg=%@ end=%@ statecode=%@", ok, msg, [r endTime], [r statecode]);
 
             gBusy = NO;
             if (ok) {
                 t3a_setStatus([NSString stringWithFormat:@"验证成功，到期 %@", gEndTime ?: @"-"],
                               [UIColor colorWithRed:.4 green:1 blue:.55 alpha:1]);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6*NSEC_PER_SEC)),
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{ t3a_unlock(); });
             } else {
                 t3a_setStatus(msg, [UIColor colorWithRed:1 green:.45 blue:.45 alpha:1]);
@@ -248,8 +254,9 @@ static void t3a_startVerify(NSString *kami) {
     tip.textColor = [UIColor colorWithWhite:0.55 alpha:1];
     tip.textAlignment = NSTextAlignmentCenter;
 
-    NSArray *views = @[title, tf, btn, st, tip];
-    for (UIView *v in views) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
+    NSArray *all = @[title, tf, btn, st, tip];
+    for (UIView *v in all) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
+
     NSDictionary *v = NSDictionaryOfVariableBindings(title, tf, btn, st, tip);
     for (NSString *h in @[@"H:|-30-[title]-30-|", @"H:|-30-[tf]-30-|",
                           @"H:|-30-[btn]-30-|", @"H:|-30-[st]-30-|", @"H:|-30-[tip]-30-|"]) {
@@ -289,8 +296,8 @@ static void t3a_startHeartbeat(void) {
     if (timer) return;
     if (gQueue == NULL) gQueue = dispatch_queue_create("com.t3a.verify", DISPATCH_QUEUE_SERIAL);
     timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gQueue);
-    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 300ull*NSEC_PER_SEC),
-                              300ull*NSEC_PER_SEC, 30ull*NSEC_PER_SEC);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 300ull * NSEC_PER_SEC),
+                              300ull * NSEC_PER_SEC, 30ull * NSEC_PER_SEC);
     dispatch_source_set_event_handler(timer, ^{
         @autoreleasepool {
             if (!gVerify || !gKami || !gAuthorized) return;
@@ -298,34 +305,33 @@ static void t3a_startHeartbeat(void) {
             T3LoginResult *r = nil;
             if ([gVerify respondsToSelector:s]) {
                 T3LoginResult *(*fn)(id, SEL, NSString*, NSString*) =
-                    (T3LoginResult *(*)(id, SEL, NSString*, NSString*))objc_msgSend;
+                    (T3LoginResult *(*)(id, SEL, NSString*, NSString*))(void *)objc_msgSend;
                 r = fn(gVerify, s, gKami, gStatecode ?: @"");
             }
-            if (r && r.success) {
-                if (r.statecode) gStatecode = r.statecode;
-                if (r.endTime)   gEndTime   = r.endTime;
+            if (r && [r success]) {
+                if ([r statecode]) gStatecode = [r statecode];
+                if ([r endTime])   gEndTime   = [r endTime];
                 t3a_writeState();
                 t3a_log(@"心跳正常，到期 %@", gEndTime);
             } else {
-                t3a_log(@"心跳失败：%@", r.error ?: @"?");
+                t3a_log(@"心跳失败：%@", [r error] ?: @"?");
             }
         }
     });
     dispatch_resume(timer);
 }
 
-#pragma mark ================= AppDelegate 兜底（防止被 app 的 window 盖住） =================
+#pragma mark ================= AppDelegate 兜底 =================
 
 static void t3a_appDidFinishLaunching(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
     if (gOrigDidFinishLaunching) {
-        ((void(*)(id, SEL, UIApplication*, NSDictionary*))gOrigDidFinishLaunching)(self, _cmd, app, opts);
+        ((void (*)(id, SEL, UIApplication*, NSDictionary*))gOrigDidFinishLaunching)(self, _cmd, app, opts);
     }
     t3a_log(@"didFinishLaunching 归来，重新抬起门禁窗口");
-    if (!gAuthorized) t3a_showLock();          // 防止被 app 自己的 window 盖住
+    if (!gAuthorized) t3a_showLock();
 }
 
 static void t3a_installDelegateHook(void) {
-    // 优先用实测类名，其次读 Info.plist 的 NSPrincipalClass，最后遍历 app delegate
     Class c = NSClassFromString(@"MainApplicationDelegate");
     if (!c) {
         NSString *n = [NSBundle mainBundle].infoDictionary[@"NSPrincipalClass"];
@@ -349,22 +355,16 @@ static void t3a_installDelegateHook(void) {
 
 static void t3a_install(void) {
     @autoreleasepool {
-        t3a_log(@"=== T3Adapter v2 启动 ===");
+        t3a_log(@"=== T3Adapter v3 启动 ===");
         t3a_readState();
         t3a_log(@"缓存卡密=%@ 到期=%@", gKami ?: @"(无)", gEndTime ?: @"(无)");
 
-        // ① 先建门禁（不管 app 后面干什么，遮罩已经在最上层）
-        t3a_showLock();
+        t3a_showLock();                 // ① 先把遮罩铺上
+        t3a_installDelegateHook();      // ② 防被 app 的 window 盖住
+        t3a_startHeartbeat();           // ③ 心跳
 
-        // ② 兜底：app 启动完成后把门禁再抬一次
-        t3a_installDelegateHook();
-
-        // ③ 心跳
-        t3a_startHeartbeat();
-
-        // ④ SDK 预热（后台，失败也不影响门禁显示）
         if (gQueue == NULL) gQueue = dispatch_queue_create("com.t3a.verify", DISPATCH_QUEUE_SERIAL);
-        dispatch_async(gQueue, ^{ t3a_makeVerify(); });
+        dispatch_async(gQueue, ^{ t3a_makeVerify(); });   // ④ SDK 预热
 
         t3a_log(@"=== T3Adapter 安装完成 ===");
     }

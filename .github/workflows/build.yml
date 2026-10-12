@@ -46,6 +46,9 @@ jobs:
           echo "=== SDK ===";     xcrun --sdk iphoneos --show-sdk-path
           echo "=== arch ===";    uname -m
 
+      - name: 源码静态粗检（括号配平/关键结构/objc_msgSend 转换）
+        run: python3 ci/lint_adapter.py
+
       - name: 拿基础 IPA（下载直链 或 仓库内 ci/base.ipa）
         env:
           URL: ${{ github.event.inputs.base_ipa }}

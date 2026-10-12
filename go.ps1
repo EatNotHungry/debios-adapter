@@ -45,6 +45,10 @@ if ($LASTEXITCODE -ne 0) {
 $who = (gh api user --jq .login)
 Ok "已登录为 $who"
 
+# 让 git 用 gh 当凭据助手（不配的话 push 会另找凭据）
+gh auth setup-git --hostname github.com 2>$null
+Ok "git 凭据助手已接上 gh"
+
 # ---------- 2. 建仓库（已存在就跳过） ----------
 Step 2 "创建仓库 $User/$Repo"
 $exists = $false

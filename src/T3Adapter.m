@@ -574,19 +574,43 @@ static NSDictionary *t3Call(NSString *code, NSArray<NSString *> *keys,
 
 static BOOL     gAuthorized = NO;
 static BOOL     gBusy = NO;
-static UIView  *gLockView = nil;          // ★ 浮层，不再是 UIWindow（避免抢 key window）
-static UILabel  *gStatusLbl = nil;
+static BOOL     gIsChildProcess = NO;    // ★ HUD 子进程：完全不介入
+static UIAlertController *gAlert = nil;  // ★ 只用系统弹窗，绝不新建窗口/浮层
+static NSString *gLastStatus = nil;
 static UITextField *gCodeField = nil;
 static NSString *gKami = nil, *gStatecode = nil, *gEndTime = nil;
 static dispatch_queue_t gQueue = NULL;
 
-static void t3_showLock(void);
+// ★ 判断是否是 app spawn 出来的 HUD 子进程（这类进程绝不能被门禁干扰）
+static BOOL t3_detectChildProcess(void) {
+    @try {
+        for (NSString *a in [NSProcessInfo processInfo].arguments) {
+            if ([a isEqualToString:@"-hud"] || [a containsString:@"-hud"] ||
+                [a isEqualToString:@"--hud"] || [a containsString:@"hud"]) {
+                t3log(@"  ⚠ 检测到子进程参数: %@", a);
+                return YES;
+            }
+        }
+        NSString *cls = NSStringFromClass([[UIApplication sharedApplication] class]);
+        if (cls && [cls containsString:@"HUD"]) {
+            t3log(@"  ⚠ UIApplication 类名 = %@（HUD 子进程）", cls);
+            return YES;
+        }
+        NSString *dcls = NSStringFromClass([[[UIApplication sharedApplication] delegate] class]);
+        if (dcls && [dcls containsString:@"HUD"]) {
+            t3log(@"  ⚠ AppDelegate 类名 = %@（HUD 子进程）", dcls);
+            return YES;
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
+
+static void t3_presentGate(void);
 
 static void t3_setStatus(NSString *s, UIColor *c) {
+    gLastStatus = s;
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!gStatusLbl) return;
-        gStatusLbl.text = s ?: @"";
-        gStatusLbl.textColor = c ?: [UIColor whiteColor];
+        if (gAlert) gAlert.message = s ?: @"";
     });
 }
 
@@ -626,23 +650,15 @@ static NSString *t3_nowDateStr(void) {
 static void t3_unlock(void) {
     gAuthorized = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIView *v = gLockView;
-        gLockView = nil;
-        [UIView animateWithDuration:0.22 animations:^{ v.alpha = 0; } completion:^(BOOL f) {
-            [v removeFromSuperview];                 // ★ 彻底移除，不留任何窗口/视图
-            gCodeField = nil; gStatusLbl = nil;
-            // 把 key window 还给 app 自己的窗口（保险）
-            UIApplication *app = [UIApplication sharedApplication];
-            for (UIWindow *w in app.windows) {
-                if (w.windowLevel <= UIWindowLevelNormal + 1 && !w.hidden) { [w makeKeyWindow]; break; }
-            }
-            t3log(@"  门禁浮层已移除，keyWindow 已归还 app");
+        UIAlertController *a = gAlert;
+        gAlert = nil;
+        // 只做一件事：关掉我们自己弹的系统弹窗。app 的一切原封不动。
+        if (a) [a dismissViewControllerAnimated:YES completion:^{
+            gCodeField = nil;
+            t3log(@"  门禁弹窗已关闭，app 状态零改动");
         }];
     });
     t3log(@"✅ 验证通过，解除门禁");
-    // 后台心跳（保持卡密在线状态）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ t3log(@"  （心跳预留位）"); });
 }
 
 static void t3_verify(NSString *kami) {
@@ -686,8 +702,8 @@ static void t3_verify(NSString *kami) {
             }
             if (!j) {
                 gBusy = NO;
-                t3_setStatus(e.localizedDescription ?: @"无法连接验证服务器",
-                             [UIColor colorWithRed:1 green:.45 blue:.45 alpha:1]);
+                t3_setStatus(e.localizedDescription ?: @"无法连接验证服务器", nil);
+                t3_presentGate();
                 return;
             }
             id codeObj = j[@"code"];
@@ -695,8 +711,8 @@ static void t3_verify(NSString *kami) {
                        || ([codeObj isKindOfClass:[NSString class]] && [codeObj isEqualToString:@"200"]);
             if (!okCode) {
                 gBusy = NO;
-                t3_setStatus((lastMsg.length && ![lastMsg isEqualToString:@"(null)"]) ? lastMsg : @"验证失败",
-                             [UIColor colorWithRed:1 green:.45 blue:.45 alpha:1]);
+                t3_setStatus((lastMsg.length && ![lastMsg isEqualToString:@"(null)"]) ? lastMsg : @"验证失败", nil);
+                t3_presentGate();      // ★ 失败自动重弹（带错误原因）
                 return;
             }
             (void)imei;
@@ -709,14 +725,15 @@ static void t3_verify(NSString *kami) {
                         || [end isEqualToString:@"(null)"] || !token.length || !statecode.length || !rtime);
             if (bad) {
                 gBusy = NO;
-                t3_setStatus(@"响应数据缺少必要字段", [UIColor colorWithRed:1 green:.45 blue:.45 alpha:1]);
+                t3_setStatus(@"响应数据缺少必要字段", nil);
+                t3_presentGate();
                 return;
             }
             long long diff = llabs((long long)time(NULL) - rtime.longLongValue);
             if (diff > 5) {
                 gBusy = NO;
-                t3_setStatus([NSString stringWithFormat:@"时间戳校验失败，相差%lld秒", diff],
-                             [UIColor colorWithRed:1 green:.45 blue:.45 alpha:1]);
+                t3_setStatus([NSString stringWithFormat:@"时间戳校验失败，相差%lld秒", diff], nil);
+                t3_presentGate();
                 return;
             }
             // token 校验（官方 SDK 公式）：md5(id + appkey + s_string + end_time + now)
@@ -730,133 +747,105 @@ static void t3_verify(NSString *kami) {
 
             gKami = kami; gStatecode = statecode; gEndTime = end;
             gBusy = NO;
-            t3_setStatus([NSString stringWithFormat:@"验证成功，到期 %@", end],
-                         [UIColor colorWithRed:.4 green:1 blue:.55 alpha:1]);
+            t3_setStatus([NSString stringWithFormat:@"验证成功，到期 %@", end], nil);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ t3_unlock(); });
         }
     });
 }
 
-#pragma mark ================= UI（★ 浮层，不用 UIWindow） =================
+#pragma mark ================= UI：只用系统弹窗，零侵入 =================
 
-// 用 UIView 而不是 UIWindow：不改动 app 的窗口体系，
-// 解锁后 removeFromSuperview 即可完全消失，绝对不会干扰"开启游戏"等按钮
-@interface T3ALockView : UIView <UITextFieldDelegate>
-@end
+// ★ 设计原则：绝不动 app 的任何 UI
+//   × 不新建 UIWindow
+//   × 不往 app 的视图树里加任何子视图
+//   × 不碰 keyWindow
+//   × 不 swizzle app 的方法
+//   √ 只弹一个系统自带的 UIAlertController，验证通过就关掉
+//   （UIAlertController 由 UIKit 自己管理生命周期，跟 app 的界面互不干扰）
 
-@implementation T3ALockView
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (!self) return nil;
-    self.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.985];
-    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-
-    UILabel *title = [UILabel new];
-    title.text = @"卡密验证";
-    title.font = [UIFont boldSystemFontOfSize:26];
-    title.textColor = [UIColor whiteColor];
-    title.textAlignment = NSTextAlignmentCenter;
-
-    UITextField *tf = [UITextField new];
-    tf.placeholder = @"请输入卡密";
-    tf.borderStyle = UITextBorderStyleRoundedRect;
-    tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
-    tf.autocorrectionType = UITextAutocorrectionTypeNo;
-    tf.spellCheckingType = UITextSpellCheckingTypeNo;
-    tf.text = gKami ?: @"";
-    tf.delegate = self;
-    tf.returnKeyType = UIReturnKeyGo;
-    gCodeField = tf;
-
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    [btn setTitle:@"验 证" forState:UIControlStateNormal];
-    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:19];
-    btn.backgroundColor = [UIColor colorWithRed:0.16 green:0.55 blue:1.0 alpha:1];
-    btn.layer.cornerRadius = 9;
-    [btn addTarget:self action:@selector(onTap) forControlEvents:UIControlEventTouchUpInside];
-
-    UILabel *st = [UILabel new];
-    st.font = [UIFont systemFontOfSize:13];
-    st.textAlignment = NSTextAlignmentCenter;
-    st.numberOfLines = 0;
-    gStatusLbl = st;
-
-    UILabel *tip = [UILabel new];
-    tip.text = @"输入卡密后才能进入";
-    tip.font = [UIFont systemFontOfSize:12];
-    tip.textColor = [UIColor colorWithWhite:0.55 alpha:1];
-    tip.textAlignment = NSTextAlignmentCenter;
-
-    NSArray *all = @[title, tf, btn, st, tip];
-    for (UIView *v in all) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
-    NSDictionary *v = NSDictionaryOfVariableBindings(title, tf, btn, st, tip);
-    for (NSString *h in @[@"H:|-30-[title]-30-|", @"H:|-30-[tf]-30-|", @"H:|-30-[btn]-30-|",
-                          @"H:|-30-[st]-30-|", @"H:|-30-[tip]-30-|"]) {
-        [self addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:h options:0 metrics:nil views:v]];
-    }
-    [self addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
-        @"V:|-130-[title]-40-[tf(44)]-18-[btn(46)]-20-[st]-8-[tip]" options:0 metrics:nil views:v]];
-    return self;
-}
-- (void)onTap { t3_verify(gCodeField.text); }
-- (BOOL)textFieldShouldReturn:(UITextField *)tf { [self onTap]; [tf resignFirstResponder]; return YES; }
-// 吃掉所有触摸，防止点到下面的 app UI
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
-@end
-
-// 找 app 自己的主窗口（跳过我可能创建的、以及 app 的 HUD/Menu 窗口）
-static UIWindow *t3_hostWindow(void) {
+static UIViewController *t3_topVC(void) {
     UIApplication *app = [UIApplication sharedApplication];
-    id del = app.delegate;
-    if ([del respondsToSelector:@selector(window)]) {
-        UIWindow *w = [del performSelector:@selector(window)];
-        if (w && w.windowLevel <= UIWindowLevelNormal + 1) return w;
+    UIWindow *w = nil;
+    for (UIWindow *x in app.windows) {
+        if (x.isKeyWindow) { w = x; break; }
     }
-    UIWindow *best = nil;
-    for (UIWindow *w in app.windows) {
-        if (w.windowLevel > UIWindowLevelNormal + 1) continue;
-        if (w.hidden && !w.isKeyWindow) continue;
-        if ([w isKindOfClass:NSClassFromString(@"HUDMainWindow")] ||
-            [w isKindOfClass:NSClassFromString(@"MenuWindow")]) continue;
-        if (w.isKeyWindow) return w;
-        if (!best) best = w;
+    if (!w) {
+        for (UIWindow *x in app.windows) {
+            if (x.windowLevel <= UIWindowLevelNormal + 1 && !x.hidden) { w = x; break; }
+        }
     }
-    if (best) return best;
-    return app.keyWindow;
+    if (!w) w = app.keyWindow;
+    UIViewController *vc = w.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    if ([vc isKindOfClass:[UIAlertController class]]) return nil;   // 已经是我们的弹窗
+    return vc;
 }
 
-static void t3_showLock(void) {
-    if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ t3_showLock(); }); return; }
-    if (gAuthorized || gLockView) return;
-    UIWindow *host = t3_hostWindow();
-    if (!host) {
-        t3log(@"⚠️ 还没拿到主窗口，200ms 后重试");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ t3_showLock(); });
-        return;
+static void t3_presentGate(void) {
+    if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ t3_presentGate(); }); return; }
+    if (gIsChildProcess || gAuthorized) return;
+
+    // 弹窗还在，且还在显示 -> 什么都不做
+    if (gAlert) {
+        if (gAlert.presentingViewController) return;
+        gAlert = nil;   // 已经被 app 关掉了，下面重弹
     }
-    // 移除可能存在的旧浮层
-    for (UIView *sub in host.subviews) {
-        if ([sub isKindOfClass:[T3ALockView class]]) [sub removeFromSuperview];
-    }
-    T3ALockView *lock = [[T3ALockView alloc] initWithFrame:host.bounds];
-    [host addSubview:lock];
-    [host bringSubviewToFront:lock];
-    gLockView = lock;
-    t3log(@"🔒 门禁浮层已挂到主窗口 %@ (level=%.0f)  —— 未新建任何 UIWindow",
-          NSStringFromClass([host class]), host.windowLevel);
+    UIViewController *host = t3_topVC();
+    if (!host) return;   // 还没有可用的控制器，等下一次定时器
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"卡密验证"
+                                    message:(gLastStatus ?: @"请输入卡密后使用")
+                             preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"请输入卡密";
+        tf.text = gKami ?: @"";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.spellCheckingType = UITextSpellCheckingTypeNo;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+        gCodeField = tf;
+    }];
+    __weak UIAlertController *weakA = a;
+    [a addAction:[UIAlertAction actionWithTitle:@"验 证" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *act) {
+        NSString *txt = weakA.textFields.firstObject.text;
+        gAlert = nil;
+        t3_verify(txt);                 // 失败会自动重弹（见 t3_verify）
+    }]];
+    a.view.tintColor = [UIColor colorWithRed:0.10 green:0.48 blue:1.0 alpha:1];
+    [host presentViewController:a animated:YES completion:^{
+        t3log(@"🔒 已弹出系统卡密弹窗（未新建窗口、未改动 app 任何界面）");
+    }];
+    gAlert = a;
 }
 
-#pragma mark ================= AppDelegate 兜底 =================
+// 定时巡检：没验证 且 没有弹窗 -> 弹出来
+static void t3_gateTimer(void) {
+    if (gIsChildProcess || gAuthorized) return;
+    t3_presentGate();
+}
 
-static IMP gOrigDidFinish = NULL;
-static void t3_didFinish(id self, SEL _cmd, UIApplication *app, NSDictionary *opts) {
-    if (gOrigDidFinish) ((void (*)(id, SEL, UIApplication*, NSDictionary*))gOrigDidFinish)(self, _cmd, app, opts);
-    t3log(@"★ didFinishLaunching 归来");
-    if (!gAuthorized) t3_showLock();
+#pragma mark ================= 门禁巡检（不 swizzle app 任何方法） =================
+
+// ★ 完全不 hook app 的类和方法：只设一个定时器，定期检查
+//   「未验证 且 没有弹窗」就弹出来。判定代价极低，对 app 零影响。
+static void t3_startGateWatch(void) {
+    static dispatch_source_t timer = NULL;
+    if (timer) return;
+    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                              (uint64_t)(0.8 * NSEC_PER_SEC), (uint64_t)(0.2 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(timer, ^{
+        if (gAuthorized || gIsChildProcess) {
+            dispatch_source_cancel(timer);
+            timer = NULL;
+            return;
+        }
+        t3_gateTimer();
+    });
+    dispatch_resume(timer);
 }
 
 #pragma mark ================= 安装 =================
@@ -868,8 +857,15 @@ static void t3_ctor(void) {
         t3_installCrashHandlers();
         @try {
             t3log(@"========================================");
-            t3log(@"=== T3Adapter v13 启动 (pid=%d) ===", getpid());
+            t3log(@"=== T3Adapter v17 启动 (pid=%d) ===", getpid());
             t3log(@"日志文件: %s", gLogPathBuf);
+            // ★ 先判断是不是 app spawn 出来的 HUD 子进程 —— 是的话立刻返回，绝不介入
+            gIsChildProcess = t3_detectChildProcess();
+            if (gIsChildProcess) {
+                t3log(@"=== 这是 HUD/子进程：完全跳过门禁，不做任何介入 ===");
+                return;
+            }
+            t3log(@"主进程确认（不是 HUD 子进程）");
             t3log(@"架构/系统: iOS %@", [[UIDevice currentDevice] systemVersion]);
             BOOL ok = loadPublicKey();
             t3log(@"RSA 公钥解析: %@", ok ? @"成功（1024位，e=65537）" : @"❌ 失败");
@@ -886,30 +882,8 @@ static void t3_ctor(void) {
                 bn_pow_e(&y, &x, &gN);
                 t3log(@"自检 大数模幂: %@", bn_cmp(&y, &x) != 0 ? @"✅ 运算完成" : @"❓ 结果等于输入");
             }
-            Class c = NSClassFromString(@"MainApplicationDelegate");
-            if (c) {
-                SEL s = NSSelectorFromString(@"application:didFinishLaunchingWithOptions:");
-                Method m = class_getInstanceMethod(c, s);
-                if (m) {
-                    gOrigDidFinish = method_getImplementation(m);
-                    class_replaceMethod(c, s, (IMP)t3_didFinish, method_getTypeEncoding(m));
-                    t3log(@"✅ 已挂 %@ 的 didFinishLaunchingWithOptions:", c);
-                } else {
-                    t3log(@"⚠️ MainApplicationDelegate 没有 didFinishLaunchingWithOptions:");
-                }
-            } else {
-                t3log(@"⚠️ 没找到 MainApplicationDelegate（靠定时兜底）");
-            }
-            // 多重兜底：无论 AppDelegate 钩子成不成功，都会确保门禁出现
-            for (int i = 0; i < 6; i++) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.6 + i * 0.9) * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (!gAuthorized) {
-                        t3log(@"  [兜底%d] 检查门禁状态...", i + 1);
-                        t3_showLock();
-                    }
-                });
-            }
+            t3_startGateWatch();
+            t3log(@"门禁定时巡检已启动（不 hook app 任何方法）");
             t3log(@"=== 注入完成 ===");
         } @catch (NSException *ex) {
             t3log(@"💥 构造器抛异常: %@ / %@", ex.name, ex.reason);

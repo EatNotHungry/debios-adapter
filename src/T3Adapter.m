@@ -574,8 +574,7 @@ static NSDictionary *t3Call(NSString *code, NSArray<NSString *> *keys,
 
 static BOOL     gAuthorized = NO;
 static BOOL     gBusy = NO;
-static BOOL     gLockShown = NO;
-static UIWindow *gLockWindow = nil;
+static UIView  *gLockView = nil;          // ★ 浮层，不再是 UIWindow（避免抢 key window）
 static UILabel  *gStatusLbl = nil;
 static UITextField *gCodeField = nil;
 static NSString *gKami = nil, *gStatecode = nil, *gEndTime = nil;
@@ -627,14 +626,23 @@ static NSString *t3_nowDateStr(void) {
 static void t3_unlock(void) {
     gAuthorized = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *w = gLockWindow;
-        gLockWindow = nil; gLockShown = NO;
-        [UIView animateWithDuration:0.25 animations:^{ w.alpha = 0; } completion:^(BOOL f) {
-            w.hidden = YES; [w resignKeyWindow];
+        UIView *v = gLockView;
+        gLockView = nil;
+        [UIView animateWithDuration:0.22 animations:^{ v.alpha = 0; } completion:^(BOOL f) {
+            [v removeFromSuperview];                 // ★ 彻底移除，不留任何窗口/视图
             gCodeField = nil; gStatusLbl = nil;
+            // 把 key window 还给 app 自己的窗口（保险）
+            UIApplication *app = [UIApplication sharedApplication];
+            for (UIWindow *w in app.windows) {
+                if (w.windowLevel <= UIWindowLevelNormal + 1 && !w.hidden) { [w makeKeyWindow]; break; }
+            }
+            t3log(@"  门禁浮层已移除，keyWindow 已归还 app");
         }];
     });
     t3log(@"✅ 验证通过，解除门禁");
+    // 后台心跳（保持卡密在线状态）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ t3log(@"  （心跳预留位）"); });
 }
 
 static void t3_verify(NSString *kami) {
@@ -730,15 +738,21 @@ static void t3_verify(NSString *kami) {
     });
 }
 
-#pragma mark ================= UI =================
+#pragma mark ================= UI（★ 浮层，不用 UIWindow） =================
 
-@interface T3ALockVC : UIViewController <UITextFieldDelegate>
+// 用 UIView 而不是 UIWindow：不改动 app 的窗口体系，
+// 解锁后 removeFromSuperview 即可完全消失，绝对不会干扰"开启游戏"等按钮
+@interface T3ALockView : UIView <UITextFieldDelegate>
 @end
 
-@implementation T3ALockVC
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithWhite:0.07 alpha:1.0];
+@implementation T3ALockView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.backgroundColor = [UIColor colorWithWhite:0.06 alpha:0.985];
+    self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+
     UILabel *title = [UILabel new];
     title.text = @"卡密验证";
     title.font = [UIFont boldSystemFontOfSize:26];
@@ -750,8 +764,10 @@ static void t3_verify(NSString *kami) {
     tf.borderStyle = UITextBorderStyleRoundedRect;
     tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
     tf.autocorrectionType = UITextAutocorrectionTypeNo;
+    tf.spellCheckingType = UITextSpellCheckingTypeNo;
     tf.text = gKami ?: @"";
     tf.delegate = self;
+    tf.returnKeyType = UIReturnKeyGo;
     gCodeField = tf;
 
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -775,32 +791,63 @@ static void t3_verify(NSString *kami) {
     tip.textAlignment = NSTextAlignmentCenter;
 
     NSArray *all = @[title, tf, btn, st, tip];
-    for (UIView *v in all) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
+    for (UIView *v in all) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
     NSDictionary *v = NSDictionaryOfVariableBindings(title, tf, btn, st, tip);
     for (NSString *h in @[@"H:|-30-[title]-30-|", @"H:|-30-[tf]-30-|", @"H:|-30-[btn]-30-|",
                           @"H:|-30-[st]-30-|", @"H:|-30-[tip]-30-|"]) {
-        [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:h options:0 metrics:nil views:v]];
+        [self addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:h options:0 metrics:nil views:v]];
     }
-    [self.view addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
-        @"V:|-120-[title]-40-[tf(44)]-18-[btn(46)]-20-[st]-8-[tip]" options:0 metrics:nil views:v]];
+    [self addConstraints:[NSLayoutConstraint constraintsWithVisualFormat:
+        @"V:|-130-[title]-40-[tf(44)]-18-[btn(46)]-20-[st]-8-[tip]" options:0 metrics:nil views:v]];
+    return self;
 }
 - (void)onTap { t3_verify(gCodeField.text); }
-- (BOOL)textFieldShouldReturn:(UITextField *)tf { [self onTap]; return YES; }
+- (BOOL)textFieldShouldReturn:(UITextField *)tf { [self onTap]; [tf resignFirstResponder]; return YES; }
+// 吃掉所有触摸，防止点到下面的 app UI
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
 @end
+
+// 找 app 自己的主窗口（跳过我可能创建的、以及 app 的 HUD/Menu 窗口）
+static UIWindow *t3_hostWindow(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    id del = app.delegate;
+    if ([del respondsToSelector:@selector(window)]) {
+        UIWindow *w = [del performSelector:@selector(window)];
+        if (w && w.windowLevel <= UIWindowLevelNormal + 1) return w;
+    }
+    UIWindow *best = nil;
+    for (UIWindow *w in app.windows) {
+        if (w.windowLevel > UIWindowLevelNormal + 1) continue;
+        if (w.hidden && !w.isKeyWindow) continue;
+        if ([w isKindOfClass:NSClassFromString(@"HUDMainWindow")] ||
+            [w isKindOfClass:NSClassFromString(@"MenuWindow")]) continue;
+        if (w.isKeyWindow) return w;
+        if (!best) best = w;
+    }
+    if (best) return best;
+    return app.keyWindow;
+}
 
 static void t3_showLock(void) {
     if (![NSThread isMainThread]) { dispatch_async(dispatch_get_main_queue(), ^{ t3_showLock(); }); return; }
-    if (gAuthorized) return;
-    if (gLockWindow) { [gLockWindow makeKeyAndVisible]; return; }
-    if (gLockShown) return;
-    gLockShown = YES;
-    UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    w.windowLevel = UIWindowLevelAlert + 20;
-    w.backgroundColor = [UIColor colorWithWhite:0.07 alpha:1];
-    w.rootViewController = [T3ALockVC new];
-    [w makeKeyAndVisible];
-    gLockWindow = w;
-    t3log(@"🔒 门禁窗口已建立");
+    if (gAuthorized || gLockView) return;
+    UIWindow *host = t3_hostWindow();
+    if (!host) {
+        t3log(@"⚠️ 还没拿到主窗口，200ms 后重试");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ t3_showLock(); });
+        return;
+    }
+    // 移除可能存在的旧浮层
+    for (UIView *sub in host.subviews) {
+        if ([sub isKindOfClass:[T3ALockView class]]) [sub removeFromSuperview];
+    }
+    T3ALockView *lock = [[T3ALockView alloc] initWithFrame:host.bounds];
+    [host addSubview:lock];
+    [host bringSubviewToFront:lock];
+    gLockView = lock;
+    t3log(@"🔒 门禁浮层已挂到主窗口 %@ (level=%.0f)  —— 未新建任何 UIWindow",
+          NSStringFromClass([host class]), host.windowLevel);
 }
 
 #pragma mark ================= AppDelegate 兜底 =================
@@ -851,7 +898,17 @@ static void t3_ctor(void) {
                     t3log(@"⚠️ MainApplicationDelegate 没有 didFinishLaunchingWithOptions:");
                 }
             } else {
-                t3log(@"⚠️ 没找到 MainApplicationDelegate（靠 RootViewController 兜底）");
+                t3log(@"⚠️ 没找到 MainApplicationDelegate（靠定时兜底）");
+            }
+            // 多重兜底：无论 AppDelegate 钩子成不成功，都会确保门禁出现
+            for (int i = 0; i < 6; i++) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.6 + i * 0.9) * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (!gAuthorized) {
+                        t3log(@"  [兜底%d] 检查门禁状态...", i + 1);
+                        t3_showLock();
+                    }
+                });
             }
             t3log(@"=== 注入完成 ===");
         } @catch (NSException *ex) {

@@ -76,6 +76,56 @@ GitHub → Actions → `Build T3Adapter & Repack IPA` → **Run workflow**：
 
 ---
 
+## 挂在私有仓库（比如 `debios`）上怎么弄
+
+私有库和公开库只有三个差别，别的完全一样：
+
+### 1) 推送脚本改用 `push-private.ps1`
+
+```powershell
+.\push-private.ps1 -User EatNotHungry -Repo debios
+```
+
+它会：
+- 问你要一个 **Personal Access Token**（[在这里建](https://github.com/settings/tokens)，权限勾 `repo` + `workflow`）
+- 本地把 `lfs.url` 配成带 token 的形式（只写进 `.git/config`，**不会提交**）
+- 用带 token 的 remote 推送，不弹窗
+
+### 2) 必须在仓库里加一个 Secret（CI 拉 LFS 要用）
+
+私有库的 LFS 需要认证，不然 CI 里 `actions/checkout` 只会拿到一个 133 字节的指针文件。
+
+打开 `https://github.com/<User>/<Repo>/settings/secrets/actions` → **New repository secret**：
+
+| Name | Value |
+|---|---|
+| `LFS_TOKEN` | 你那个 Personal Access Token |
+
+workflow 里已经写好了自动处理：
+
+```yaml
+- name: 私有库 LFS 授权（公开库自动跳过）
+  env:
+    LFS_TOKEN: ${{ secrets.LFS_TOKEN }}
+  run: |
+    if [ -n "$LFS_TOKEN" ]; then
+      git config --local lfs.url "https://${GITHUB_ACTOR}:${LFS_TOKEN}@github.com/${GITHUB_REPOSITORY}.git/info/lfs"
+      git lfs pull
+    fi
+```
+
+### 3) 计费注意
+
+| | 公开库 | 私有库 |
+|---|---|---|
+| macOS runner | **免费不限** | 按 **10 倍**扣分钟（一次构建约 30~60 分钟额度） |
+| 免费额度 | — | 2000 分钟/月 → 约 30~60 次 |
+| LFS 带宽 | 不计费 | **1GB/月**，`base.ipa` 40MB → 约 25 次 checkout |
+
+> 建议：调 `src/T3Adapter.m` 的阶段先放**公开库**里迭代，改完了再同步到私有库出正式包。
+
+---
+
 ## 三、CI 到底干了什么
 
 ```yaml

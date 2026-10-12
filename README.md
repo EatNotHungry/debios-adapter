@@ -2,9 +2,51 @@
 
 不用装 Xcode。把仓库推到 GitHub，**Actions 里的 macOS runner 免费帮你编译 dylib、注入主程序、ldid 签名、重打包 IPA**，产物直接下载。
 
+> ✅ 本仓库**已经本地初始化好 git 并提交完毕**，`ci/base.ipa`（基础包，40MB，走 Git LFS）
+> 也已经放进去了。你只需要：**在 GitHub 建一个空仓库 → 跑一次 `push.ps1` → 等下产物**。
+
 ---
 
-## 一、仓库结构
+## 最快路径（三步）
+
+### 第 1 步：在 GitHub 建空仓库
+
+打开 https://github.com/new
+
+- Repository name 随便起，比如 `t3-adapter`
+- **不要**勾 `Add a README file` / `.gitignore` / `license`（要完全空的）
+- Create repository
+
+### 第 2 步：推送
+
+在本目录打开 PowerShell，跑：
+
+```powershell
+# 把 YourName / t3-adapter 换成你的
+.\push.ps1 -User YourName -Repo t3-adapter
+```
+
+脚本会自动：检查 git → 配提交身份（第一次会问你名字邮箱，随便填）→ 启用 LFS → 提交 → 设 remote → 推送。
+
+推送时会弹窗让你登录 GitHub（浏览器授权 或 粘贴 Personal Access Token）。
+
+> 没有 token 就在这里建一个：https://github.com/settings/tokens
+> 权限勾 `repo`（私有库）或至少 `public_repo` + `workflow`。
+
+### 第 3 步：拿产物
+
+推送完成后 `ci/base.ipa` 已在仓库里，**CI 会自动跑一次**（不用手动点）。
+
+打开 `https://github.com/<你的用户名>/<仓库名>/actions` → 点最新那次 run → 等 3~6 分钟 → 页面底部 **Artifacts** → 下载 `T3Adapter-产物`：
+
+```
+T3Adapter.dylib    ← 编好的适配层
+out.ipa            ← 已注入 + 已 ldid 签名 + 已重打包，直接装
+```
+
+---
+
+## 仓库结构
 
 ```
 .
@@ -12,64 +54,25 @@
 ├─ src/
 │   ├─ T3Adapter.m                 ← 适配层源码（卡密门禁）
 │   └─ T3Verify.h                  ← 从 T3Gate.dylib 反出的接口
-└─ ci/
-    ├─ inject_dylib.py             ← 往主程序里加 LC_LOAD_DYLIB（纯 Python，无需 insert_dylib）
-    ├─ extract_ents.py             ← 从原签名里抽 entitlements 给 ldid 用
-    └─ base.ipa                    ← 基础包（自己放，见下）
+├─ ci/
+│   ├─ base.ipa                    ← 基础包（Git LFS，已放好）
+│   ├─ inject_dylib.py             ← 往主程序加 LC_LOAD_DYLIB（纯 Python）
+│   ├─ extract_ents.py             ← 抽 entitlements 给 ldid
+│   └─ selftest.py                 ← 本地自检（不联网）
+├─ push.ps1                        ← 一键推送脚本
+└─ README.md
 ```
 
 ---
 
-## 二、跑起来
+## 想自己手动跑 CI（不用 base.ipa，填直链）
 
-### 1) 推仓库
-
-```bash
-git init
-git add .
-git commit -m "T3 adapter + CI"
-git branch -M main
-git remote add origin https://github.com/<你的用户名>/<仓库名>.git
-git push -u origin main
-```
-
-### 2) 准备基础包（二选一）
-
-**方式 A：手动跑，直接填直链（推荐，仓库不臃肿）**
-
-把 `工作室雷达_T3卡密_v8_适配版.ipa` 传到任意能直链的地方（GitHub Release / 蓝奏云 / 对象存储），然后：
-
-GitHub → **Actions** → 左边选 `Build T3Adapter & Repack IPA` → 右侧 **Run workflow**：
+GitHub → Actions → `Build T3Adapter & Repack IPA` → **Run workflow**：
 
 | 输入 | 填什么 |
 |---|---|
-| `base_ipa` | 那个 IPA 的**直链** |
-| `sign_mode` | `adhoc`（越狱机/TrollStore） |
-
-点绿色按钮，等 3~6 分钟。
-
-**方式 B：把包含在仓库里**
-
-把 IPA 放到 `ci/base.ipa`。38MB 建议开 Git LFS：
-
-```bash
-git lfs install
-git lfs track "ci/*.ipa"
-git add .gitattributes ci/base.ipa
-git commit -m "add base ipa"
-git push
-```
-
-> ⚠️ 不要直接 `git add` 大 IPA 到普通仓库（GitHub 单文件 100MB 限制 + 仓库会变很胖）。
-
-### 3) 下载产物
-
-Actions 跑完 → 点进那次 run → 页面底部 **Artifacts** → 下载 `T3Adapter-产物`，里面是：
-
-```
-T3Adapter.dylib    ← 编译好的适配层
-out.ipa            ← 已注入 + 已签名 + 已重打包
-```
+| `base_ipa` | 基础包的**直链**（留空则用仓库里的 `ci/base.ipa`） |
+| `sign_mode` | `adhoc`（越狱机/TrollStore）或 `none`（只出 dylib） |
 
 ---
 

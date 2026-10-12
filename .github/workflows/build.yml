@@ -1,0 +1,162 @@
+name: Build T3Adapter & Repack IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ipa:
+        description: '基础 IPA 的下载直链（留空则读仓库里 ci/base.ipa）'
+        required: false
+        default: ''
+      sign_mode:
+        description: '签名方式：adhoc(越狱/TrollStore) 或 none(只出 dylib)'
+        required: true
+        default: 'adhoc'
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'src/**'
+      - '.github/workflows/**'
+
+jobs:
+  build:
+    runs-on: macos-14            # 免费 macOS runner，自带 Xcode 15 / iPhoneOS17 SDK
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出仓库（含 LFS，基础包是 LFS 文件）
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: 环境信息
+        run: |
+          echo "=== Xcode ==="; xcodebuild -version
+          echo "=== SDK ===";     xcrun --sdk iphoneos --show-sdk-path
+          echo "=== arch ===";    uname -m
+
+      - name: 拿基础 IPA（下载直链 或 仓库内 ci/base.ipa）
+        env:
+          URL: ${{ github.event.inputs.base_ipa }}
+        run: |
+          mkdir -p work
+          if [ -n "$URL" ]; then
+            echo "[*] 正在下载: $URL"
+            curl -L --retry 3 -o work/base.ipa "$URL"
+          elif [ -f ci/base.ipa ]; then
+            echo "[*] 使用仓库内 ci/base.ipa"
+            cp ci/base.ipa work/base.ipa
+          else
+            echo "[!] 没有基础 IPA。请二选一："
+            echo "    1) 手动跑 workflow 时填 base_ipa 输入框（网盘直链）"
+            echo "    2) 把 IPA 放到 ci/base.ipa（建议开 Git LFS）"
+            exit 1
+          fi
+          ls -lh work/base.ipa
+
+      - name: 解包 IPA
+        run: |
+          cd work
+          unzip -q base.ipa -d unpacked
+          ls -la unpacked
+          ls -la unpacked/Payload/Diss.app | head -40
+
+      - name: 编译 T3Adapter.dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          cd work
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=12.0 \
+            -dynamiclib \
+            -fobjc-arc \
+            -fmodules \
+            -I "$GITHUB_WORKSPACE/src" \
+            -isysroot "$SDK" \
+            -framework UIKit -framework Foundation -framework ObjectiveC -framework CoreGraphics \
+            -install_name @executable_path/T3Adapter.dylib \
+            -o T3Adapter.dylib \
+            "$GITHUB_WORKSPACE/src/T3Adapter.m"
+          echo "=== 产物 ==="
+          ls -lh T3Adapter.dylib
+          file T3Adapter.dylib
+          otool -L T3Adapter.dylib
+
+      - name: 安装 ldid（用于签名）
+        if: ${{ github.event.inputs.sign_mode != 'none' }}
+        run: |
+          brew install ldid 2>/dev/null || {
+            git clone --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
+            cd /tmp/ldid && make CXXFLAGS=-g -j4 && sudo cp ldid /usr/local/bin/
+          }
+          ldid -v || true
+
+      - name: 注入 T3Adapter 并重新签名
+        if: ${{ github.event.inputs.sign_mode != 'none' }}
+        run: |
+          cd work
+          APP=unpacked/Payload/Diss.app
+
+          # 把新 dylib 放进 app
+          cp T3Adapter.dylib "$APP/T3Adapter.dylib"
+
+          # 用包里自带的 insert_dylib 注入（如果是 arm64 的 mac 版才跑得动，跑不动就退化到 python 注入）
+          if file "$APP/insert_dylib" | grep -q 'Mach-O 64-bit x86_64\|Mach-O 64-bit arm64'; then
+            chmod +x "$APP/insert_dylib"
+            cp "$APP/Diss" /tmp/Diss.bak
+            if "$APP/insert_dylib" @executable_path/T3Adapter.dylib "$APP/Diss" "$APP/Diss.new" --strip-codesig --all-yes; then
+              mv "$APP/Diss.new" "$APP/Diss"; chmod +x "$APP/Diss"
+              echo "[+] insert_dylib 注入成功"
+            else
+              echo "[!] insert_dylib 跑不动，走 python 注入"
+              python3 "$GITHUB_WORKSPACE/ci/inject_dylib.py" "$APP/Diss" @executable_path/T3Adapter.dylib
+            fi
+          else
+            echo "[*] 仓库自带 insert_dylib 不是本机架构，直接 python 注入"
+            python3 "$GITHUB_WORKSPACE/ci/inject_dylib.py" "$APP/Diss" @executable_path/T3Adapter.dylib
+          fi
+
+          # 签名：entitlements 从原 Diss 里抽（保留 platform-application 等）
+          python3 "$GITHUB_WORKSPACE/ci/extract_ents.py" "$APP/Diss" /tmp/ents.plist || true
+
+          ldid -S "$APP/T3Adapter.dylib"
+          ldid -S "$APP/T3Gate.dylib"
+          if [ -f /tmp/ents.plist ]; then
+            ldid -S/tmp/ents.plist "$APP/Diss" 2>/dev/null || ldid -S /tmp/ents.plist "$APP/Diss" || ldid -S "$APP/Diss"
+          else
+            ldid -S "$APP/Diss"
+          fi
+
+          echo "=== 签名后校验 ==="
+          ldid -e "$APP/Diss" | head -20 || true
+
+      - name: 只出 dylib（sign_mode=none 时）
+        if: ${{ github.event.inputs.sign_mode == 'none' }}
+        run: |
+          echo "[*] 只编译，不注入不签名。产物见 artifact。"
+
+      - name: 重新打包 IPA
+        if: ${{ github.event.inputs.sign_mode != 'none' }}
+        run: |
+          cd work
+          rm -f out.ipa
+          cd unpacked
+          # 去掉备份/垃圾文件
+          find . -name '*.bak' -delete
+          find . -name '._*' -delete
+          zip -qry ../out.ipa Payload
+          cd ..
+          ls -lh out.ipa
+          echo "=== 包内结构确认 ==="
+          unzip -l out.ipa | head -12
+          unzip -p out.ipa Payload/Diss.app/T3Adapter.dylib > /tmp/chk.dylib
+          cmp -s /tmp/chk.dylib T3Adapter.dylib && echo "[+] T3Adapter.dylib 已进包" || echo "[!] dylib 校验失败"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: T3Adapter-产物
+          path: |
+            work/T3Adapter.dylib
+            work/out.ipa
+          if-no-files-found: warn
+          retention-days: 30

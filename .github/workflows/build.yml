@@ -118,21 +118,22 @@ jobs:
             fi
           done
           echo "=== ★ 零侵入校验：不应改动 app 的窗口或方法 ==="
-          echo "=== ★ 绝不接管 signal（会破坏 kfd 漏洞利用）==="
-          for BAD in _signal _sigaction _NSGetUncaughtExceptionHandler; do
-            case "\" in
-              _NSGetUncaughtExceptionHandler)
-                nm -u T3Adapter.dylib 2>/dev/null | grep -q "\" \
-                  && echo "  [ok] 链式获取原有异常处理器" \
-                  || echo "  [!!] 未引用 \";;
-              *)
-                if nm -u T3Adapter.dylib 2>/dev/null | grep -qx "\"; then
-                  echo "  [!!] 引用了 \ —— 接管信号会破坏 app 的漏洞利用流程"; FAIL=1
-                else
-                  echo "  [ok] 未引用 \"
-                fi;;
-            esac
-          done
+          echo "=== ★ 绝不接管 signal（接管会破坏 kfd 漏洞利用）==="
+          if nm -u T3Adapter.dylib 2>/dev/null | grep -qx "_signal"; then
+            echo "  [!!] 引用了 _signal"; FAIL=1
+          else
+            echo "  [ok] 未引用 _signal"
+          fi
+          if nm -u T3Adapter.dylib 2>/dev/null | grep -qx "_sigaction"; then
+            echo "  [!!] 引用了 _sigaction"; FAIL=1
+          else
+            echo "  [ok] 未引用 _sigaction"
+          fi
+          if nm -u T3Adapter.dylib 2>/dev/null | grep -q "_NSGetUncaughtExceptionHandler"; then
+            echo "  [ok] 链式获取 app 原有异常处理器"
+          else
+            echo "  [ok] 未引用 NSGetUncaughtExceptionHandler（可选）"
+          fi
           for BAD in _class_replaceMethod _method_setImplementation; do
             if nm -u T3Adapter.dylib 2>/dev/null | grep -q "$BAD"; then
               echo "  [!!] 引用了 $BAD —— 零侵入设计不允许 swizzle app 方法"; FAIL=1

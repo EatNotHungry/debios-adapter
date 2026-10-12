@@ -1,20 +1,3 @@
-# 编译产物 / 大文件
-*.dylib
-*.o
-*.a
+_commitmsg.txt
+*-产物*
 work/
-out.ipa
-
-# 只忽略散落的 ipa；ci/base.ipa 是要提交的（走 LFS）
-*.ipa
-!ci/base.ipa
-
-# 系统垃圾
-.DS_Store
-Thumbs.db
-._*
-*.bak
-
-# 中间文件
-__pycache__/
-*.pyc

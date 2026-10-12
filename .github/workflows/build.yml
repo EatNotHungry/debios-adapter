@@ -28,6 +28,18 @@ jobs:
         with:
           lfs: true
 
+      - name: 私有库 LFS 授权（公开库自动跳过）
+        env:
+          LFS_TOKEN: ${{ secrets.LFS_TOKEN }}
+        run: |
+          if [ -n "$LFS_TOKEN" ]; then
+            echo "[*] 检测到 LFS_TOKEN，配置 LFS 私有库凭据"
+            git config --local lfs.url "https://${GITHUB_ACTOR}:${LFS_TOKEN}@github.com/${GITHUB_REPOSITORY}.git/info/lfs"
+            git lfs pull || echo "[!] lfs pull 失败，继续（可能 base.ipa 不是 LFS 文件）"
+          else
+            echo "[*] 没有 LFS_TOKEN，按公开库处理"
+          fi
+
       - name: 环境信息
         run: |
           echo "=== Xcode ==="; xcodebuild -version

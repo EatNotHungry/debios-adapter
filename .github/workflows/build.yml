@@ -107,7 +107,7 @@ jobs:
           cd work
           echo "=== 检查关键导出/依赖 ==="
           FAIL=0
-          for SYM in _objc_msgSend _NSClassFromString _class_getInstanceMethod _class_replaceMethod _UIApplicationMain; do
+          for SYM in _objc_msgSend _NSClassFromString _UIApplicationMain; do
             if nm -u T3Adapter.dylib 2>/dev/null | grep -q "$SYM"; then
               echo "  [OK] 引用 $SYM"
             else
@@ -117,6 +117,22 @@ jobs:
               esac
             fi
           done
+          echo "=== ★ 零侵入校验：不应改动 app 的窗口或方法 ==="
+          for BAD in _class_replaceMethod _method_setImplementation; do
+            if nm -u T3Adapter.dylib 2>/dev/null | grep -q "$BAD"; then
+              echo "  [!!] 引用了 $BAD —— 零侵入设计不允许 swizzle app 方法"; FAIL=1
+            else
+              echo "  [ok] 未引用 $BAD"
+            fi
+          done
+          if nm -u T3Adapter.dylib 2>/dev/null | grep -q '_UIAlertController'; then
+            echo "  [ok] 使用系统弹窗 UIAlertController（符合零侵入设计）"
+          else
+            echo "  [!!] 未引用 UIAlertController，门禁没有弹出途径"; FAIL=1
+          fi
+          if nm T3Adapter.dylib 2>/dev/null | grep -qE 'T _t3_'; then
+            echo "  [ok] 静态函数已内联/私有化"
+          fi
           echo "=== 确认没有把 T3Gate 的符号重复定义进来 ==="
           if nm T3Adapter.dylib 2>/dev/null | grep -qE 'T _T3InstallHooks|T _T3GateConstructor'; then
             echo "  [!!] 适配层里出现 T3Gate 的 C 符号，会冲突"; FAIL=1

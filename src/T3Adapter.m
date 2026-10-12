@@ -431,6 +431,8 @@ static void t3log(NSString *fmt, ...) {
     }
 }
 
+static NSUncaughtExceptionHandler *gPrevUncaught = NULL;
+
 // 未捕获 Objective-C 异常（普通线程，可安全用 NSLog/NSFileHandle）
 static void t3_uncaught(NSException *ex) {
     t3log(@"");
@@ -440,17 +442,8 @@ static void t3_uncaught(NSException *ex) {
     NSArray *st = ex.callStackSymbols;
     for (NSUInteger i = 0; i < st.count && i < 32; i++) t3log(@"  %@", st[i]);
     t3log(@"💥💥💥 结束 💥💥💥");
-}
-
-// 致命信号（只有 write()，异步信号安全）
-static void t3_signal(int sig) {
-    char b[160];
-    int n = snprintf(b, sizeof(b),
-        "\n💥💥 致命信号 %d  (11=SIGSEGV 6=SIGABRT 10=SIGBUS 4=SIGILL 5=SIGTRAP 8=SIGFPE)\n",
-        sig);
-    if (n > 0) t3_raw(b);
-    signal(sig, SIG_DFL);
-    raise(sig);
+    // ★ 链式交还 app 原有处理器
+    if (gPrevUncaught) { @try { gPrevUncaught(ex); } @catch (NSException *e3) {} }
 }
 
 // ★ 关键诊断：如果是 exit() 主动退出（不是崩溃），iOS 不会生成 ips，
@@ -461,12 +454,13 @@ static void t3_atexit(void) {
 }
 
 static void t3_installCrashHandlers(void) {
+    // ★★ 只装「未捕获异常」处理器（链式），绝不碰 signal：
+    //    本 app 是 kfd 内核漏洞驱动的内存工具，依赖 SIGSEGV/SIGBUS 等异常
+    //    完成漏洞利用。接管信号会直接破坏它的漏洞流程 -> 点开启游戏就崩。
+    gPrevUncaught = NSGetUncaughtExceptionHandler();
     NSSetUncaughtExceptionHandler(&t3_uncaught);
-    int sigs[] = {SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGTRAP, SIGFPE};
-    for (int i = 0; i < 6; i++) signal(sigs[i], t3_signal);
     atexit(t3_atexit);
 }
-
 #pragma mark ================= HTTP =================
 
 /// keys: 参数名顺序数组（★ 顺序必须与签名一致，服务端按此顺序重构签名）
@@ -580,6 +574,20 @@ static NSString *gLastStatus = nil;
 static UITextField *gCodeField = nil;
 static NSString *gKami = nil, *gStatecode = nil, *gEndTime = nil;
 static dispatch_queue_t gQueue = NULL;
+
+// ★ 静默版：不写日志、不依赖任何初始化，构造函数第一行就能用
+static BOOL t3_isChildProcessQuiet(void) {
+    @try {
+        for (NSString *a in [NSProcessInfo processInfo].arguments) {
+            if ([a isEqualToString:@"-hud"] || [a isEqualToString:@"--hud"]) return YES;
+        }
+        NSString *cls = NSStringFromClass([[UIApplication sharedApplication] class]);
+        if (cls && [cls containsString:@"HUD"]) return YES;
+        NSString *d = NSStringFromClass([[[UIApplication sharedApplication] delegate] class]);
+        if (d && [d containsString:@"HUD"]) return YES;
+    } @catch (NSException *e) {}
+    return NO;
+}
 
 // ★ 判断是否是 app spawn 出来的 HUD 子进程（这类进程绝不能被门禁干扰）
 static BOOL t3_detectChildProcess(void) {
@@ -853,19 +861,21 @@ static void t3_startGateWatch(void) {
 __attribute__((constructor))
 static void t3_ctor(void) {
     @autoreleasepool {
+        // ★★★ 第一件事：判断是不是 app spawn 出来的 HUD 子进程。
+        //     是的话「立刻返回」——不写日志、不装处理器、不 open 文件，
+        //     连一行代码都不执行，确保绝不影响 app 启动游戏的流程。
+        if (t3_isChildProcessQuiet()) {
+            return;
+        }
         t3_openLog();
         t3_installCrashHandlers();
         @try {
             t3log(@"========================================");
-            t3log(@"=== T3Adapter v17 启动 (pid=%d) ===", getpid());
+            t3log(@"=== T3Adapter v18 启动 (pid=%d) ===", getpid());
             t3log(@"日志文件: %s", gLogPathBuf);
-            // ★ 先判断是不是 app spawn 出来的 HUD 子进程 —— 是的话立刻返回，绝不介入
-            gIsChildProcess = t3_detectChildProcess();
-            if (gIsChildProcess) {
-                t3log(@"=== 这是 HUD/子进程：完全跳过门禁，不做任何介入 ===");
-                return;
-            }
+            gIsChildProcess = NO;
             t3log(@"主进程确认（不是 HUD 子进程）");
+            t3log(@"已确认：未接管任何 signal（不干扰 kfd 漏洞利用）");
             t3log(@"架构/系统: iOS %@", [[UIDevice currentDevice] systemVersion]);
             BOOL ok = loadPublicKey();
             t3log(@"RSA 公钥解析: %@", ok ? @"成功（1024位，e=65537）" : @"❌ 失败");
